@@ -1,126 +1,104 @@
-﻿#include <opencv2/opencv.hpp>
+#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <cmath>
-#include <algorithm>
 
 using namespace cv;
 using namespace std;
 
-struct TrackedObject {
-    int id;
-    string shapeClass;
-    Point2f center;
-    Rect bbox;
-    int lostCounter;
-    static int nextId;
-    TrackedObject(const Point2f& c, const Rect& b, const string& cls)
-        : center(c), bbox(b), shapeClass(cls), lostCounter(0) {
-        id = nextId++;
-    }
-};
-int TrackedObject::nextId = 1;
-
-string classifyShape(const vector<Point>& contour) {
-    double area = contourArea(contour);
-    if (area < 200) return "Unknown";
-    double perimeter = arcLength(contour, true);
-    if (perimeter <= 0) return "Unknown";
-    vector<Point> approx;
-    approxPolyDP(contour, approx, 0.02 * perimeter, true);
-    int vertices = approx.size();
+string detectShape(const vector<Point>& approx, double area, double perimeter) {
+    int vertices = (int)approx.size();
     if (vertices == 3) return "Triangle";
     if (vertices == 4) {
-        Rect r = boundingRect(contour);
-        double aspect = (double)r.width / r.height;
-        if (aspect > 0.85 && aspect < 1.15) return "Square";
-        else return "Rectangle";
+        Rect rect = boundingRect(approx);
+        double aspectRatio = (double)rect.width / rect.height;
+        if (aspectRatio >= 0.95 && aspectRatio <= 1.05)
+            return "Square";
+        else
+            return "Rectangle";
     }
+    if (vertices == 5) return "Pentagon";
+    if (vertices == 6) return "Hexagon";
     double circularity = 4 * CV_PI * area / (perimeter * perimeter);
-    if (circularity > 0.8 && vertices >= 6) return "Circle";
+    if (circularity > 0.8) return "Circle";
     return "Unknown";
 }
 
 int main() {
     VideoCapture cap("Motion abstract geometric shapes.mkv");
-    if (!cap.isOpened()) { cerr << "Error opening video" << endl; return -1; }
+    if (!cap.isOpened()) {
+        cerr << "Error opening video file!\n";
+        return -1;
+    }
+
     double fps = cap.get(CAP_PROP_FPS);
-    Size frameSize(cap.get(CAP_PROP_FRAME_WIDTH), cap.get(CAP_PROP_FRAME_HEIGHT));
-    VideoWriter writerContours("contours_output.avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, frameSize);
-    VideoWriter writerLabels("labeled_output.avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, frameSize);
-    if (!writerContours.isOpened() || !writerLabels.isOpened()) { cerr << "Error creating video writers" << endl; return -1; }
+    int width = (int)cap.get(CAP_PROP_FRAME_WIDTH);
+    int height = (int)cap.get(CAP_PROP_FRAME_HEIGHT);
+
+    VideoWriter writer("result.avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(width, height));
+    if (!writer.isOpened()) {
+        cerr << "Error creating output video file!\n";
+        return -1;
+    }
 
     Mat frame, gray, binary;
-    vector<TrackedObject> trackedObjects;
-    const float MAX_DIST = 50.0f;
+    vector<vector<Point>> contours;
 
     while (cap.read(frame)) {
+        if (frame.empty()) break;
+
         cvtColor(frame, gray, COLOR_BGR2GRAY);
         threshold(gray, binary, 240, 255, THRESH_BINARY_INV);
-        vector<vector<Point>> contours;
         findContours(binary, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-        vector<pair<Point2f, Rect>> newDetections;
-        for (const auto& c : contours) {
-            if (contourArea(c) < 200) continue;
-            Rect bbox = boundingRect(c);
-            Point2f center(bbox.x + bbox.width / 2.0f, bbox.y + bbox.height / 2.0f);
-            newDetections.emplace_back(center, bbox);
-        }
+        for (const auto& contour : contours) {
+            double perimeter = arcLength(contour, true);
+            double area = contourArea(contour);
+            if (area < 50) continue;
 
-        vector<bool> usedNew(newDetections.size(), false);
-        for (auto& obj : trackedObjects) {
-            obj.lostCounter++;
-            int bestIdx = -1;
-            float bestDist = MAX_DIST;
-            for (size_t i = 0; i < newDetections.size(); ++i) {
-                if (usedNew[i]) continue;
-                float dist = norm(obj.center - newDetections[i].first);
-                if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+            vector<Point> approx;
+            double epsilon = 0.02 * perimeter;
+            approxPolyDP(contour, approx, epsilon, true);
+
+            string shapeName = detectShape(approx, area, perimeter);
+
+            Scalar color;
+            if (shapeName == "Triangle") color = Scalar(255, 0, 0);
+            else if (shapeName == "Square") color = Scalar(0, 255, 0);
+            else if (shapeName == "Rectangle") color = Scalar(0, 255, 255);
+            else if (shapeName == "Circle") color = Scalar(0, 165, 255);
+            else if (shapeName == "Pentagon") color = Scalar(255, 255, 0);
+            else if (shapeName == "Hexagon") color = Scalar(255, 0, 255);
+            else color = Scalar(255, 255, 255);
+
+            Rect bbox = boundingRect(contour);
+            rectangle(frame, bbox, color, 2);
+
+            string text = shapeName + " | " + to_string((int)area);
+            int fontFace = FONT_HERSHEY_DUPLEX;
+            double fontScale = 0.5;
+            int baseline = 0;
+            Size textSize = getTextSize(text, fontFace, fontScale, 1, &baseline);
+            Point textPos(bbox.x + 5, bbox.y - 5);
+            if (textPos.y - textSize.height < 0) {
+                textPos = Point(bbox.x + 5, bbox.y + textSize.height + 5);
             }
-            if (bestIdx != -1) {
-                obj.center = newDetections[bestIdx].first;
-                obj.bbox = newDetections[bestIdx].second;
-                obj.lostCounter = 0;
-                usedNew[bestIdx] = true;
-            }
+            putText(frame, text, textPos, fontFace, fontScale, Scalar(0, 0, 0), 1);
         }
 
-        for (size_t i = 0; i < newDetections.size(); ++i) {
-            if (!usedNew[i]) {
-                for (const auto& c : contours) {
-                    Rect b = boundingRect(c);
-                    if (abs(b.x - newDetections[i].second.x) < 5 && abs(b.y - newDetections[i].second.y) < 5) {
-                        string shape = classifyShape(c);
-                        if (shape != "Unknown")
-                            trackedObjects.emplace_back(newDetections[i].first, newDetections[i].second, shape);
-                        break;
-                    }
-                }
-            }
-        }
+        string info = "Shapes: " + to_string(contours.size());
+        putText(frame, info, Point(10, 30), FONT_HERSHEY_DUPLEX, 0.7, Scalar(0, 0, 0), 1);
 
-        trackedObjects.erase(remove_if(trackedObjects.begin(), trackedObjects.end(),
-            [](const TrackedObject& obj) { return obj.lostCounter > 10; }), trackedObjects.end());
+        writer.write(frame);
 
-        Mat frameContours = frame.clone();
-        for (const auto& c : contours) {
-            if (contourArea(c) >= 200)
-                drawContours(frameContours, vector<vector<Point>>{c}, -1, Scalar(0, 255, 0), 2);
-        }
-        writerContours.write(frameContours);
+        imshow("Detected Shapes", frame);
+        imshow("Binary Mask", binary);
 
-        for (const auto& obj : trackedObjects) {
-            rectangle(frame, obj.bbox, Scalar(0, 255, 0), 2);
-            Point textCenter(obj.bbox.x + obj.bbox.width / 2, obj.bbox.y + obj.bbox.height / 2);
-            putText(frame, obj.shapeClass, textCenter, FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 255), 2);
-        }
-        writerLabels.write(frame);
-
-        imshow("Shape Tracking", frame);
         if (waitKey(30) == 27) break;
     }
+
+    cap.release();
+    writer.release();
     destroyAllWindows();
     return 0;
 }
